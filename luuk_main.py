@@ -12,6 +12,7 @@ warnings.filterwarnings('ignore')
 
 import pandas as pd
 import numpy as np
+from numpy.linalg import lstsq
 
 import requests
 
@@ -93,7 +94,7 @@ def get_fixtures(fixtures_url):
     
     return df
 
-#%% Load in the results
+#%% Load in the data
 
 df = get_results_dataframe(start_year=2016, end_year=2025)
 
@@ -111,7 +112,6 @@ fixtures_df = get_fixtures(fixtures_url)
 # Create a dictionary for id to name mapping
 team_id_to_name = dict(zip(teams_df['Id'], teams_df['Name']))
 competition_id_to_name = dict(zip(tournaments_df['Id'], tournaments_df['Name']))
-
 
 # Replace HomeTeam and AwayTeam ids with names for the results dataframe
 df['HomeTeam'] = df['HomeTeam'].map(team_id_to_name)
@@ -131,17 +131,70 @@ fixtures_df['Tournament'] = fixtures_df['Tournament'].map(competition_id_to_name
 df['MatchName'] =  df["HomeTeam"].astype(str) + "-" + df["AwayTeam"].astype(str)
 fixtures_df['MatchName'] =  fixtures_df["HomeTeam"].astype(str) + "-" + fixtures_df["AwayTeam"].astype(str)
 
-# Clip HomeScore and AwayScore to a maximum of 3
-df["HomeScore"] = df["HomeScore"].clip(upper=4)
-df["AwayScore"] = df["AwayScore"].clip(upper=3)
+#%% Rolling average of goals scored and conceded
+
+# Create date column
+df["Date"] = df["Month"].astype(str) + "-" + df["Day"].astype(str) + "-" + df["Year"].astype(str)
+df["Date"] = pd.to_datetime(df["Date"])
+
+# Create date column for fixtures
+fixtures_df["Date"] = fixtures_df["Month"].astype(str) + "-" + fixtures_df["Day"].astype(str) + "-" + fixtures_df["Year"].astype(str)
+fixtures_df["Date"] = pd.to_datetime(fixtures_df["Date"])
+
+# Calculate rolling averages for each team
+def calculate_rolling_average_goals(df, window=10):
+    # Initialize dictionaries to store rolling averages
+    rolling_averages = {team: [] for team in pd.concat([df["HomeTeam"], df["AwayTeam"]]).unique()}
+
+    # Create a new dataframe to store the results
+    results = pd.DataFrame(columns=["Team", "Date", "RollingAvgGoalsScored", "RollingAvgGoalsConceded"])
+
+    # Iterate over each team
+    for team in rolling_averages.keys():
+        # Filter matches involving the team
+        team_matches = df[(df["HomeTeam"] == team) | (df["AwayTeam"] == team)].copy()
+        team_matches["GoalsScored"] = team_matches.apply(
+            lambda row: row["HomeScore"] if row["HomeTeam"] == team else row["AwayScore"], axis=1
+        )
+        team_matches["GoalsConceded"] = team_matches.apply(
+            lambda row: row["AwayScore"] if row["HomeTeam"] == team else row["HomeScore"], axis=1
+        )
+        team_matches["RollingAvgGoalsScored"] = team_matches["GoalsScored"].ewm(span=window, adjust=False).mean().shift(1)
+        team_matches["RollingAvgGoalsConceded"] = team_matches["GoalsConceded"].ewm(span=window, adjust=False).mean().shift(1)
+        
+        # Remove the first 10 matches since they don't have a valid rolling average
+        team_matches = team_matches.iloc[window:]
+        
+        # Append results to the results dataframe
+        team_results = team_matches[["Date", "RollingAvgGoalsScored", "RollingAvgGoalsConceded"]].copy()
+        team_results["Team"] = team
+        results = pd.concat([results, team_results], ignore_index=True)
+
+    # Sort results by date and team
+    results = results.sort_values(by=["Team", "Date"])
+    
+    return results
+
+rolling_avg_df = calculate_rolling_average_goals(df)
+
+#%% Filter the dataframe
+
+# Throw all games away with too much goals
+df["TotalGoals"] = df["HomeScore"] + df["AwayScore"]
+df = df[df["TotalGoals"] <= 5]
 
 # Adding a Result column to the results
 df["Result"] = df["HomeScore"].astype(str) + "-" + df["AwayScore"].astype(str)
+
 #%% Swapping results so higher ranked team 'plays at home' to improve model
+
 def reorder_result_and_rating(row):
     rating_team1 = row['RatingTeam1']
     rating_team2 = row['RatingTeam2']
     result = row['Result']
+
+    name_team1 = row["HomeTeam"]
+    name_team2 = row["AwayTeam"]
 
     score_team1, score_team2 = map(int, result.split('-'))
 
@@ -149,36 +202,79 @@ def reorder_result_and_rating(row):
         new_result = f"{score_team1}-{score_team2}"
         higher_rating = rating_team1
         lower_rating = rating_team2
+        higher_team_name = name_team1
+        lower_team_name  = name_team2
     else:
         new_result = f"{score_team2}-{score_team1}"
         higher_rating = rating_team2
         lower_rating = rating_team1
+        higher_team_name = name_team2
+        lower_team_name  = name_team1
 
-    return pd.Series([higher_rating, lower_rating, new_result], index=['NewResult', 'HigherRating', 'LowerRating'])
+    return pd.Series([new_result, higher_rating, lower_rating, higher_team_name, lower_team_name], index=['NewResult', 'HigherRating', 'LowerRating', 'HigherTeam', 'LowerTeam'])
 
-df[['HigherRating', 'LowerRating', 'NewResult']] = df.apply(reorder_result_and_rating, axis=1)
+df[['NewResult', 'HigherRating', 'LowerRating', 'HigherTeam', 'LowerTeam']] = df.apply(reorder_result_and_rating, axis=1)
 
 #%% Do something similar but for fixtures_df
+
 def reorder_matchname_and_rating(row):
     rating_team1 = row['RatingTeam1']
     rating_team2 = row['RatingTeam2']
     match_name = row['MatchName']
-
+    
+    name_team1 = row["HomeTeam"]
+    name_team2 = row["AwayTeam"]
+    
     team1, team2 = match_name.split('-')
 
     if rating_team1 >= rating_team2:
         new_match_name = f"{team1}-{team2}"
         higher_rating = rating_team1
         lower_rating = rating_team2
+        higher_team_name = name_team1
+        lower_team_name  = name_team2
+
     else:
         new_match_name = f"{team2}-{team1}"
         higher_rating = rating_team2
         lower_rating = rating_team1
+        higher_team_name = name_team2
+        lower_team_name  = name_team1
 
-    return pd.Series([new_match_name, higher_rating, lower_rating],
-                     index=['NewMatchName', 'HigherRating', 'LowerRating'])
+    return pd.Series([new_match_name, higher_rating, lower_rating, higher_team_name, lower_team_name],
+                     index=['NewMatchName', 'HigherRating', 'LowerRating', 'HigherTeam', 'LowerTeam'])
 
-fixtures_df[['NewMatchName', 'HigherRating', 'LowerRating']] = fixtures_df.apply(reorder_matchname_and_rating, axis=1)
+fixtures_df[['NewMatchName', 'HigherRating', 'LowerRating', 'HigherTeam', 'LowerTeam']] = fixtures_df.apply(reorder_matchname_and_rating, axis=1)
+
+#%% Merge the Rolling average goals scored and conceded
+
+# Merge the rolling averages with the main dataframe
+def add_rolling_averages(df, rolling_avg_df):
+    # Merge rolling averages for HigherTeam
+    higher_team_avg = rolling_avg_df.rename(columns={
+        "Team": "HigherTeam", 
+        "RollingAvgGoalsScored": "HigherTeamScoring", 
+        "RollingAvgGoalsConceded": "HigherTeamConceding"
+    })
+    df = pd.merge(df, higher_team_avg, how="left", left_on=["HigherTeam", "Date"], right_on=["HigherTeam", "Date"])
+    
+    # Merge rolling averages for LowerTeam
+    lower_team_avg = rolling_avg_df.rename(columns={
+        "Team": "LowerTeam", 
+        "RollingAvgGoalsScored": "LowerTeamScoring", 
+        "RollingAvgGoalsConceded": "LowerTeamConceding"
+    })
+    df = pd.merge(df, lower_team_avg, how="left", left_on=["LowerTeam", "Date"], right_on=["LowerTeam", "Date"])
+    
+    return df
+
+df = add_rolling_averages(df, rolling_avg_df)
+
+df = df.dropna(subset=["HigherTeamScoring", "HigherTeamConceding", "LowerTeamScoring", "LowerTeamConceding"])
+
+df["HigherTeamExpectedScoring"] = df["HigherTeamScoring"] - df["LowerTeamConceding"]
+df["HigherTeamExpectedConceding"] = df["HigherTeamConceding"] - df["LowerTeamScoring"]
+
 
 #%% Add columns to the results and fixtures dataframes
 
@@ -201,7 +297,8 @@ df = df[(df["Tournament"] != "Friendly") & (df["Tournament"] != "Friendly tourna
 
 # Do not use the world cup in training
 world_cup = df[df["Tournament"] == "World Cup"]
-world_cup[['NewMatchName', 'HigherRating', 'LowerRating']] = world_cup.apply(reorder_matchname_and_rating, axis=1)
+world_cup[['NewMatchName', 'HigherRating', 'LowerRating', 'HigherTeam', 'LowerTeam']] = world_cup.apply(reorder_matchname_and_rating, axis=1)
+
 
 df = df[df["Tournament"] != "World Cup"]
 df = df[df["LowerRating"] >= 1600]
@@ -224,12 +321,11 @@ num_classes = len(unique_classes)
 
 # Split the data into training and testing sets
 # TODO; run model with only RatingDifferenceAbsolute
-X = df[["RatingDifferenceAbsolute"]] #, "RatingDifferenceRelative", "RatingTotal"]] #TODO also change back down below
+X = df[["RatingDifferenceAbsolute", "HigherTeamExpectedScoring", "HigherTeamExpectedConceding"]] #, "RatingDifferenceRelative", "RatingTotal"]] #TODO also change back down below
 y = df["ResultTransformed"]
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
 
 # Check the unique classes in the training set
-unique_classes_train = y_train.unique()
+unique_classes_train = y.unique()
 unique_classes_train.sort()
 
 # Add a dummy row with the missing class to the training data
@@ -237,13 +333,16 @@ missing_classes = set(range(num_classes)) - set(unique_classes_train)
 for missing_class in missing_classes:
     dummy_row = pd.DataFrame({
         "RatingDifferenceAbsolute": [0],
-        "RatingDifferenceRelative": [0],
-        "RatingTotal": [0],
+        "HigherTeamExpectedScoring" : [0],
+        "HigherTeamExpectedConceding": [0],
         "ResultTransformed": [missing_class]
     })
     # Append the dummy row to the training data
-    X_train = pd.concat([pd.DataFrame(X_train), dummy_row[["RatingDifferenceAbsolute"]]],ignore_index=True) #"RatingDifferenceRelative", "RatingTotal"]]], ignore_index=True)
-    y_train = pd.concat([pd.Series(y_train), dummy_row["ResultTransformed"]], ignore_index=True)
+    X_train = pd.concat([X, dummy_row[["RatingDifferenceAbsolute", "HigherTeamExpectedScoring", "HigherTeamExpectedConceding"]]], ignore_index=True)
+    y_train = pd.concat([y, dummy_row["ResultTransformed"]], ignore_index=True)
+
+
+#%% Get the best param grid
 
 # Define the parameter grid for GridSearchCV including max_iter
 param_grid = { # TODO create custom score here, based on points for Tokai
@@ -259,11 +358,24 @@ param_grid = { # TODO create custom score here, based on points for Tokai
 grid_search = GridSearchCV(LogisticRegression(), param_grid, cv=5, n_jobs=-1, scoring='neg_log_loss')
 
 # Perform the grid search on the training data
-grid_search.fit(X_train, y_train)
+grid_search.fit(X, y)
 
 # Get the best parameters and the best score from the grid search
 best_params = grid_search.best_params_
 best_score = grid_search.best_score_
+
+print("Best Parameters:", best_params)
+print("Best Cross-Validation Score:", best_score)
+
+#%% Print the best parameters and the best score
+
+import json
+
+# Save best parameters to a JSON file
+with open('best_params.json', 'w') as f:
+    json.dump(best_params, f)
+
+#%%
 
 # Load best parameters from JSON file
 import json
@@ -273,26 +385,35 @@ print("Loaded Best Parameters (JSON):", best_params)
 
 # Train the Logistic Regression model with the best parameters
 best_model = LogisticRegression(**best_params)
-best_model.fit(X_train, y_train)
+best_model.fit(X, y)
 
-# Predict probabilities on the test set
-probabilities = best_model.predict_proba(X_test)
+#%% Get the expect scoring and conceding 
 
-# Create a DataFrame to display the results
-probability_df = pd.DataFrame(probabilities, columns=label_encoder.classes_)
-probability_df["ActualResult"] = label_encoder.inverse_transform(y_test)
-probability_df["PredictedResult"] = label_encoder.inverse_transform(best_model.predict(X_test))
+def get_latest_record(team, date, rolling_avg_df):
+    # Filter the rolling_avg_df for the team and dates before the given date
+    team_records = rolling_avg_df[(rolling_avg_df["Team"] == team) & (rolling_avg_df["Date"] < date)]
+    if not team_records.empty:
+        return team_records.iloc[-1]  # Get the most recent record
+    else:
+        return None
 
-probability_df.to_csv("probabilities.csv")
+# Function to fill in the expected scoring and conceding columns
+def fill_expected_columns(fixtures_df, rolling_avg_df):
+    fixtures_df["HigherTeamExpectedScoring"] = fixtures_df.apply(
+        lambda row: get_latest_record(row["HigherTeam"], row["Date"], rolling_avg_df)["RollingAvgGoalsScored"] 
+                    if get_latest_record(row["HigherTeam"], row["Date"], rolling_avg_df) is not None else None,
+        axis=1
+    )
+    
+    fixtures_df["HigherTeamExpectedConceding"] = fixtures_df.apply(
+        lambda row: get_latest_record(row["HigherTeam"], row["Date"], rolling_avg_df)["RollingAvgGoalsConceded"] 
+                    if get_latest_record(row["HigherTeam"], row["Date"], rolling_avg_df) is not None else None,
+        axis=1
+    )
+    
+    return fixtures_df
 
-#%% Print the best parameters and the best score
-import json
-
-# Save best parameters to a JSON file
-with open('best_params.json', 'w') as f:
-    json.dump(best_params, f)
-print("Best Parameters:", best_params)
-print("Best Cross-Validation Score:", best_score)
+fixtures_df = fill_expected_columns(fixtures_df, rolling_avg_df)
 
 #%% Functions to calculate the points, and expected points per prediction / result
 
@@ -339,10 +460,8 @@ def calculate_points(predicted_results, actual_results, game):
             return 60  # Correct winner and one of the two scores exact
     return 0
 
-#def calculate_expected_points(predicted_result, r_diff_abs, #TODO: r_diff_rel, r_total, best_model, label_encoder, game):
-def calculate_expected_points(predicted_result, r_diff_abs, best_model, label_encoder, game):
-    #probabilities = best_model.predict_proba(np.array([[r_diff_abs, r_diff_rel, r_total]]))
-    probabilities = best_model.predict_proba(np.array([[r_diff_abs]]))
+def calculate_expected_points(predicted_result, r_diff_abs, xg_scoring, xg_conceding, best_model, label_encoder, game):
+    probabilities = best_model.predict_proba(np.array([[r_diff_abs, xg_scoring, xg_conceding]]))
     probability_df = pd.DataFrame(probabilities, columns=label_encoder.classes_)
     
     xP = 0
@@ -363,6 +482,8 @@ def apply_calculate_expected_points(fixtures_df, best_model, label_encoder):
                 lambda row: calculate_expected_points(
                     result,
                     row["RatingDifferenceAbsolute"],
+                    row["HigherTeamExpectedScoring"],
+                    row["HigherTeamExpectedConceding"],
                     #row["RatingDifferenceRelative"],
                     #row["RatingTotal"],
                     best_model,
@@ -428,4 +549,4 @@ def print_all_predictions(fixtures_df, game):
         print("\n")
 
 #print_best_predictions(fixtures_df, match_name="Germany-Scotland", game="Tokai", n_predictions=6)
-print_all_predictions(fixtures_df=fixtures_df, game="Scorito")
+print_all_predictions(fixtures_df=fixtures_df, game="Tokai")
