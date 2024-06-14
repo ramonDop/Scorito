@@ -1,0 +1,1 @@
+{"C": 1, "max_iter": 5000, "penalty": "l2", "solver": "lbfgs"}
