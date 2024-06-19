@@ -6,6 +6,8 @@ Created on Thu Jun 13 10:58:12 2024
 """
 import warnings
 from sklearn.exceptions import ConvergenceWarning
+from xgboost import XGBClassifier
+
 
 # Ignore specific warning
 warnings.filterwarnings('ignore')
@@ -321,7 +323,7 @@ num_classes = len(unique_classes)
 
 # Split the data into training and testing sets
 # TODO; run model with only RatingDifferenceAbsolute
-X = df[["RatingDifferenceAbsolute", "HigherTeamExpectedScoring", "HigherTeamExpectedConceding"]] #, "RatingDifferenceRelative", "RatingTotal"]] #TODO also change back down below
+X = df[["RatingDifferenceAbsolute"]] #, "RatingDifferenceRelative", "RatingTotal"]] #TODO also change back down below
 y = df["ResultTransformed"]
 
 # Check the unique classes in the training set
@@ -333,13 +335,14 @@ missing_classes = set(range(num_classes)) - set(unique_classes_train)
 for missing_class in missing_classes:
     dummy_row = pd.DataFrame({
         "RatingDifferenceAbsolute": [0],
-        "HigherTeamExpectedScoring" : [0],
-        "HigherTeamExpectedConceding": [0],
         "ResultTransformed": [missing_class]
     })
     # Append the dummy row to the training data
-    X_train = pd.concat([X, dummy_row[["RatingDifferenceAbsolute", "HigherTeamExpectedScoring", "HigherTeamExpectedConceding"]]], ignore_index=True)
+    X_train = pd.concat([X, dummy_row[["RatingDifferenceAbsolute"]]], ignore_index=True)
     y_train = pd.concat([y, dummy_row["ResultTransformed"]], ignore_index=True)
+
+
+#%% Get the best param grid
 
 
 #%% Get the best param grid
@@ -460,8 +463,8 @@ def calculate_points(predicted_results, actual_results, game):
             return 60  # Correct winner and one of the two scores exact
     return 0
 
-def calculate_expected_points(predicted_result, r_diff_abs, xg_scoring, xg_conceding, best_model, label_encoder, game):
-    probabilities = best_model.predict_proba(np.array([[r_diff_abs, xg_scoring, xg_conceding]]))
+def calculate_expected_points(predicted_result, r_diff_abs, best_model, label_encoder, game):
+    probabilities = best_model.predict_proba(np.array([[r_diff_abs]]))
     probability_df = pd.DataFrame(probabilities, columns=label_encoder.classes_)
     
     xP = 0
@@ -482,8 +485,6 @@ def apply_calculate_expected_points(fixtures_df, best_model, label_encoder):
                 lambda row: calculate_expected_points(
                     result,
                     row["RatingDifferenceAbsolute"],
-                    row["HigherTeamExpectedScoring"],
-                    row["HigherTeamExpectedConceding"],
                     #row["RatingDifferenceRelative"],
                     #row["RatingTotal"],
                     best_model,
@@ -500,7 +501,7 @@ world_cup = apply_calculate_expected_points(world_cup, best_model, label_encoder
 
 #%%
 
-def print_best_predictions(fixtures_df, game, match_name, n_predictions):
+def print_best_prediction(fixtures_df, game, match_name, n_predictions):
     match = fixtures_df[fixtures_df["NewMatchName"] == match_name]
     
     # Assuming match is your dataframe
@@ -517,8 +518,9 @@ def print_best_predictions(fixtures_df, game, match_name, n_predictions):
     best_predictions = points_per_prediction_dataframe.sort_values(by="Expected Points", ascending=False).head(n_predictions)
 
     print(f"The best predictions for {match_name} for {game} are:", "\n", best_predictions)
+    
+    return (best_predictions.iloc[0]["Expected Points"])
 
-    return 
 
 def get_best_prediction(fixtures_df, match_name, game):
 
@@ -544,9 +546,13 @@ def get_best_prediction(fixtures_df, match_name, game):
     return best_prediction_result, round(best_prediction_xP)
     
 def print_all_predictions(fixtures_df, game):
+    predicted_points = []
     for match_name in fixtures_df["NewMatchName"]:
-        print_best_predictions(fixtures_df, match_name=match_name, game=game, n_predictions=6)
+        added_predicted_points = print_best_prediction(fixtures_df, match_name=match_name, game=game, n_predictions=5)
+        predicted_points.append(added_predicted_points)
         print("\n")
+        
+    print(f"Total predicted points for {len(predicted_points)} matches: {round(sum(predicted_points))}, which is around {round(sum(predicted_points) / len(predicted_points), 1)} points per game")
 
-#print_best_predictions(fixtures_df, match_name="Germany-Scotland", game="Tokai", n_predictions=6)
-print_all_predictions(fixtures_df=fixtures_df, game="Tokai")
+#print_best_prediction(fixtures_df, match_name="Germany-Scotland", game="Scorito", n_predictions=5)
+print_all_predictions(fixtures_df=fixtures_df, game="Scorito")
